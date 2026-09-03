@@ -202,7 +202,8 @@
 
             setStatus(true, 'Etsitään koodeja…', 88);
             var lines = FS.itemsToLines(allItems);
-            var found = FS.findMatches(queries, lines);
+            var stacks = FS.itemsToStacks(allItems);
+            var found = FS.findMatches(queries, lines, stacks);
 
             var firstFile = selectedFiles[0];
             var pageHits = [];

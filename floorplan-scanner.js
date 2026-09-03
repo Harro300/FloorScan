@@ -263,13 +263,197 @@
         return lines;
     }
 
+    function unionItemsBBox(list) {
+        var box = null;
+        (list || []).forEach(function (it) {
+            if (!it) return;
+            if (!box) {
+                box = { x: it.x, y: it.y, w: it.w, h: it.h };
+                return;
+            }
+            var x2 = Math.max(box.x + box.w, it.x + it.w);
+            var y2 = Math.max(box.y + box.h, it.y + it.h);
+            box.x = Math.min(box.x, it.x);
+            box.y = Math.min(box.y, it.y);
+            box.w = x2 - box.x;
+            box.h = y2 - box.y;
+        });
+        return box;
+    }
+
+    function pageKey(it) {
+        return (it.file || '') + '::' + (it.page || 1);
+    }
+
+    var MAX_STACK_ITEMS = 8;
+
+    function isTagNoise(text) {
+        var t = String(text || '').trim();
+        if (!t) return true;
+        if (/^\d{4,}$/.test(t)) return true;
+        if (/m²|m2/i.test(t)) return true;
+        if (/^h=$/i.test(t)) return true;
+        if (t.length > 16) return true;
+        return false;
+    }
+
+    function looksLikeSizeCode(text) {
+        return /\d+\s*\+\s*\d+x\d+|\d+x\d+[a-z]?/i.test(String(text || ''));
+    }
+
+    var TYPE_DENY = {
+        ak: 1, ks: 1, st: 1, vs: 1, us: 1, ppp: 1, lp: 1, sp: 1, tt: 1
+    };
+
+    function isTagToken(text) {
+        var t = String(text || '').trim();
+        if (!t) return false;
+        if (looksLikeSizeCode(t)) return true;
+        if (/^\d{2,3}[A-Za-z]$/.test(t)) return true;
+        if (/^\d{2,3}$/.test(t) && parseInt(t, 10) <= 250) return true;
+        if (/^(VO|TVO|TUO|TLO|SO|WC|dB)$/i.test(t)) return true;
+        if (/^SO-\S+$/i.test(t)) return true;
+        if (/^NO-?[A-Z]+$/i.test(t)) return true;
+        if (/^EI\d+$/i.test(t)) return true;
+        if (/^\d{2,3}dB$/i.test(t)) return true;
+        if (/^AR=/i.test(t)) return true;
+        if (/^[A-Za-z]{2,6}\d{0,2}$/.test(t) && !TYPE_DENY[t.toLowerCase()]) return true;
+        return false;
+    }
+
+    function isTagNear(a, b) {
+        var size = Math.max(
+            Math.min(a.h || 8, a.w || 8),
+            Math.min(b.h || 8, b.w || 8),
+            6
+        );
+        return boxGap(a, b) <= size * 1.25;
+    }
+
+    function sortStackItems(list) {
+        var verticalCount = 0;
+        list.forEach(function (it) {
+            if ((it.h || 0) > (it.w || 0) * 1.1) verticalCount++;
+        });
+        var rotated = verticalCount * 2 >= list.length;
+        return list.slice().sort(function (a, b) {
+            if (rotated) {
+                var dx = a.x - b.x;
+                if (Math.abs(dx) > 1) return dx;
+                return b.y - a.y;
+            }
+            var dy = a.y - b.y;
+            if (Math.abs(dy) > 1) return dy;
+            return a.x - b.x;
+        });
+    }
+
+    function itemsToTokens(list) {
+        var tokens = [];
+        list.forEach(function (it) {
+            String(it.text || '').split(/\s+/).forEach(function (part) {
+                if (!part) return;
+                tokens.push({ text: part, norm: normalizeQuery(part), item: it });
+            });
+        });
+        return tokens;
+    }
+
+    function growStack(seed, candidates) {
+        var cluster = [seed];
+        var queue = [seed];
+        function inCluster(it) {
+            return cluster.indexOf(it) !== -1;
+        }
+        while (queue.length && cluster.length < MAX_STACK_ITEMS) {
+            var cur = queue.shift();
+            for (var i = 0; i < candidates.length; i++) {
+                var cand = candidates[i];
+                if (inCluster(cand)) continue;
+                if (!isTagToken(cand.text)) continue;
+                if (looksLikeSizeCode(cand.text)) continue;
+                if (!isTagNear(cur, cand)) continue;
+                cluster.push(cand);
+                queue.push(cand);
+                if (cluster.length >= MAX_STACK_ITEMS) break;
+            }
+        }
+        return cluster;
+    }
+
+    function itemsToStacks(items) {
+        var buckets = {};
+        var order = [];
+        (items || []).forEach(function (it) {
+            if (isTagNoise(it.text)) return;
+            var key = pageKey(it);
+            if (!buckets[key]) {
+                buckets[key] = [];
+                order.push(key);
+            }
+            buckets[key].push(it);
+        });
+
+        var stacks = [];
+        order.forEach(function (key) {
+            var list = buckets[key];
+            var used = [];
+            function markUsed(cluster) {
+                cluster.forEach(function (it) {
+                    if (looksLikeSizeCode(it.text) && used.indexOf(it) === -1) used.push(it);
+                });
+            }
+            list.forEach(function (it) {
+                if (!looksLikeSizeCode(it.text)) return;
+                if (used.indexOf(it) !== -1) return;
+                var cluster = growStack(it, list);
+                markUsed(cluster);
+                var ordered = sortStackItems(cluster);
+                var tokens = itemsToTokens(ordered);
+                if (!tokens.length) return;
+                stacks.push({
+                    tokens: tokens,
+                    items: ordered,
+                    bbox: unionItemsBBox(ordered),
+                    page: ordered[0].page,
+                    file: ordered[0].file
+                });
+            });
+        });
+        return stacks;
+    }
+
+    function stackContainsQuery(tokens, qTokens) {
+        if (!qTokens.length) return false;
+        var left = qTokens.slice();
+        (tokens || []).forEach(function (t) {
+            var i = left.indexOf(t.norm);
+            if (i >= 0) left.splice(i, 1);
+        });
+        return left.length === 0;
+    }
+
+    function stackRestTokens(tokens, qTokens) {
+        var qSet = {};
+        (qTokens || []).forEach(function (t) { qSet[t] = true; });
+        var rest = [];
+        var seenTok = {};
+        (tokens || []).forEach(function (t) {
+            if (qSet[t.norm]) return;
+            if (seenTok[t.norm]) return;
+            seenTok[t.norm] = true;
+            rest.push(t);
+        });
+        return rest;
+    }
+
     function totalChars(items) {
         return (items || []).reduce(function (n, it) {
             return n + String(it.text || '').length;
         }, 0);
     }
 
-    function findMatches(queries, lines) {
+    function findMatches(queries, lines, stacks) {
         var results = [];
         var missing = [];
 
@@ -280,11 +464,33 @@
 
             var hits = [];
             var seen = {};
-            var body = q.split(' ').map(escapeRegex).join('\\s*');
+            var qTokens = q.split(' ').filter(Boolean);
+            var body = qTokens.map(escapeRegex).join('\\s*');
             var pattern = new RegExp(
-                '(?<![a-z0-9])' + body + '\\s*' + ID_RE.source,
+                '(?<![a-z0-9])' + body + '\\s*' + ID_RE.source + '(?![a-z0-9])',
                 'gi'
             );
+
+            function addHit(hit) {
+                var key = normalizeQuery(hit.full) + '|' + (hit.file || '') + '|' + (hit.page || 1);
+                if (seen[key]) return;
+                seen[key] = true;
+                hits.push(hit);
+            }
+
+            (stacks || []).forEach(function (stack) {
+                if (!stackContainsQuery(stack.tokens || [], qTokens)) return;
+                var rest = stackRestTokens(stack.tokens || [], qTokens);
+                var restText = rest.map(function (t) { return t.text; }).join(' ');
+                var full = restText ? query + ' ' + restText : query;
+                addHit({
+                    full: full,
+                    id: restText,
+                    page: stack.page,
+                    file: stack.file,
+                    bbox: stack.bbox || unionItemsBBox(stack.items)
+                });
+            });
 
             (lines || []).forEach(function (line) {
                 var mapped = normalizeWithMap(line.text);
@@ -293,16 +499,11 @@
                 var m;
                 while ((m = pattern.exec(mapped.text))) {
                     var id = m[1];
-                    var dedupeKey = q + '|' + id + '|' + (line.file || '') + '|' + (line.page || 1);
-                    if (seen[dedupeKey]) continue;
-                    seen[dedupeKey] = true;
-
                     var origStart = mapped.map[m.index];
                     var lastIdx = m.index + m[0].length - 1;
                     var origEnd = (mapped.map[lastIdx] != null ? mapped.map[lastIdx] : origStart) + 1;
                     var bbox = unionBBox(line.spans || [], origStart, origEnd);
-
-                    hits.push({
+                    addHit({
                         full: query + ' ' + id,
                         id: id,
                         page: line.page,
@@ -325,6 +526,7 @@
         parseQueries: parseQueries,
         extractPageItems: extractPageItems,
         itemsToLines: itemsToLines,
+        itemsToStacks: itemsToStacks,
         totalChars: totalChars,
         findMatches: findMatches
     };
