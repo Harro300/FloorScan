@@ -70,15 +70,37 @@
             .replace(/"/g, '&quot;');
     }
 
+    function fileKey(f) {
+        return (f.name || '') + '|' + (f.size || 0) + '|' + (f.lastModified || 0);
+    }
+
     function takePdfs(fileList) {
         var pdfs = Array.from(fileList || []).filter(function (f) {
             return f && (f.type === 'application/pdf' || /\.pdf$/i.test(f.name || ''));
         });
-        if (pdfs.length) {
-            selectedFiles = pdfs;
-            renderFileList();
-            showError('');
-        }
+        if (!pdfs.length) return pdfs;
+
+        var seen = {};
+        selectedFiles.forEach(function (f) {
+            seen[fileKey(f)] = true;
+        });
+        pdfs.forEach(function (f) {
+            var key = fileKey(f);
+            if (seen[key]) return;
+            seen[key] = true;
+            selectedFiles.push(f);
+        });
+
+        var input = $('scannerFileInput');
+        if (input) input.value = '';
+
+        renderFileList();
+        lastFoundLines = [];
+        var review = $('scanReviewCard');
+        if (review) review.style.display = 'none';
+        clearPreview();
+        showError('');
+        setStatus(false);
         return pdfs;
     }
 
@@ -127,14 +149,14 @@
         var scale = previewScale / (extractScale || 1);
         drawHighlights(canvas, pageHits, scale);
 
-        var host = $('scanPdfPreviewHost');
-        var preview = $('scanPdfPreview');
-        if (host && preview) {
-            host.innerHTML = '';
-            host.appendChild(canvas);
-            preview.style.display = '';
-        }
-        lastPreview = { fileName: file.name, canvas: canvas };
+        var wrap = document.createElement('div');
+        wrap.className = 'scan-pdf-preview-item';
+        var label = document.createElement('div');
+        label.className = 'scan-pdf-preview-name';
+        label.textContent = file.name;
+        wrap.appendChild(label);
+        wrap.appendChild(canvas);
+        return wrap;
     }
 
     async function extractFile(file, extractScale) {
@@ -205,15 +227,26 @@
             var stacks = FS.itemsToStacks(allItems);
             var found = FS.findMatches(queries, lines, stacks);
 
-            var firstFile = selectedFiles[0];
-            var pageHits = [];
-            found.results.forEach(function (r) {
-                r.hits.forEach(function (h) {
-                    if (h.file === firstFile.name && h.page === 1) pageHits.push(h);
-                });
-            });
             setStatus(true, 'Piirretään esikatselu…', 94);
-            await renderPreview(firstFile, extractScale, pageHits);
+            var host = $('scanPdfPreviewHost');
+            var preview = $('scanPdfPreview');
+            if (host && preview) {
+                host.innerHTML = '';
+                var rendered = [];
+                for (var p = 0; p < selectedFiles.length; p++) {
+                    var previewFile = selectedFiles[p];
+                    var pageHits = [];
+                    found.results.forEach(function (r) {
+                        r.hits.forEach(function (h) {
+                            if (h.file === previewFile.name && h.page === 1) pageHits.push(h);
+                        });
+                    });
+                    host.appendChild(await renderPreview(previewFile, extractScale, pageHits));
+                    rendered.push({ fileName: previewFile.name });
+                }
+                preview.style.display = '';
+                lastPreview = rendered;
+            }
 
             renderResults(found, selectedFiles.length, warnings);
             setStatus(false);
@@ -296,8 +329,9 @@
             }
         });
         input.addEventListener('change', function (e) {
-            var pdfs = takePdfs(e.target.files);
-            if (!pdfs.length) showError('Valitse PDF-tiedosto.');
+            var incoming = Array.from(e.target.files || []);
+            var pdfs = takePdfs(incoming);
+            if (incoming.length && !pdfs.length) showError('Valitse PDF-tiedosto.');
         });
         ['dragover', 'dragenter'].forEach(function (ev) {
             dz.addEventListener(ev, function (e) {
@@ -311,12 +345,24 @@
                 dz.classList.remove('dragover');
             });
         });
-        dz.addEventListener('drop', function (e) {
+        function onDrop(e) {
             e.preventDefault();
             dz.classList.remove('dragover');
-            var pdfs = takePdfs(e.dataTransfer && e.dataTransfer.files);
-            if (!pdfs.length) showError('Valitse PDF-tiedosto.');
-        });
+            var incoming = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+            var pdfs = takePdfs(incoming);
+            if (incoming.length && !pdfs.length) showError('Valitse PDF-tiedosto.');
+        }
+        dz.addEventListener('drop', onDrop);
+        var fileList = $('scannerFileList');
+        if (fileList) {
+            ['dragover', 'dragenter'].forEach(function (ev) {
+                fileList.addEventListener(ev, function (e) {
+                    e.preventDefault();
+                    dz.classList.add('dragover');
+                });
+            });
+            fileList.addEventListener('drop', onDrop);
+        }
     }
 
     function clearAll() {
@@ -355,6 +401,9 @@
         setFiles: function (files) {
             selectedFiles = Array.from(files || []);
             renderFileList();
+        },
+        getFiles: function () {
+            return selectedFiles.slice();
         },
         runScan: runScan
     };

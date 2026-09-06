@@ -7,6 +7,11 @@ PORT = 7070
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        super().end_headers()
+
     def log_message(self, fmt, *args):
         print("%s - %s" % (self.address_string(), fmt % args))
 
