@@ -308,6 +308,10 @@
     function isTagToken(text) {
         var t = String(text || '').trim();
         if (!t) return false;
+        var parts = t.split(/\s+/).filter(Boolean);
+        if (parts.length > 1) {
+            return parts.every(function (part) { return isTagToken(part); });
+        }
         if (looksLikeSizeCode(t)) return true;
         if (/^\d{2,3}[A-Za-z]$/.test(t)) return true;
         if (/^\d{2,3}$/.test(t) && parseInt(t, 10) <= 250) return true;
@@ -453,6 +457,46 @@
         }, 0);
     }
 
+    function hitTokens(hit) {
+        return normalizeQuery(hit && hit.full).split(' ').filter(Boolean);
+    }
+
+    function tokenSubset(shortToks, longToks) {
+        var left = (longToks || []).slice();
+        for (var i = 0; i < (shortToks || []).length; i++) {
+            var idx = left.indexOf(shortToks[i]);
+            if (idx < 0) return false;
+            left.splice(idx, 1);
+        }
+        return true;
+    }
+
+    function boxesOverlap(a, b) {
+        if (!a || !b) return true;
+        return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+    }
+
+    function collapseHits(hits) {
+        var sorted = (hits || []).slice().sort(function (a, b) {
+            var na = hitTokens(a).length;
+            var nb = hitTokens(b).length;
+            if (nb !== na) return nb - na;
+            return String(b.full || '').length - String(a.full || '').length;
+        });
+        var kept = [];
+        sorted.forEach(function (hit) {
+            var toks = hitTokens(hit);
+            var subsumed = kept.some(function (other) {
+                if ((hit.file || '') !== (other.file || '')) return false;
+                if ((hit.page || 1) !== (other.page || 1)) return false;
+                if (!tokenSubset(toks, hitTokens(other))) return false;
+                return boxesOverlap(hit.bbox, other.bbox);
+            });
+            if (!subsumed) kept.push(hit);
+        });
+        return kept;
+    }
+
     function findMatches(queries, lines, stacks) {
         var results = [];
         var missing = [];
@@ -513,6 +557,7 @@
                 }
             });
 
+            hits = collapseHits(hits);
             results.push({ query: query, hits: hits });
             if (!hits.length) missing.push(query);
         });

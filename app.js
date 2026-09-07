@@ -3,7 +3,11 @@
 
     var selectedFiles = [];
     var lastFoundLines = [];
+    var lastHits = [];
     var lastPreview = null;
+    var selectedHitIndex = null;
+    var pdfCache = {};
+    var focusSeq = 0;
 
     function $(id) {
         return document.getElementById(id);
@@ -48,18 +52,24 @@
         }).join('');
     }
 
+    function resetScanUi() {
+        lastFoundLines = [];
+        lastHits = [];
+        selectedHitIndex = null;
+        var review = $('scanReviewCard');
+        if (review) review.style.display = 'none';
+        clearPreview();
+        showError('');
+        setStatus(false);
+    }
+
     function removeFile(index) {
         if (index < 0 || index >= selectedFiles.length) return;
         selectedFiles.splice(index, 1);
         var fi = $('scannerFileInput');
         if (fi) fi.value = '';
         renderFileList();
-        lastFoundLines = [];
-        var review = $('scanReviewCard');
-        if (review) review.style.display = 'none';
-        clearPreview();
-        showError('');
-        setStatus(false);
+        resetScanUi();
     }
 
     function escapeHtml(s) {
@@ -95,46 +105,238 @@
         if (input) input.value = '';
 
         renderFileList();
-        lastFoundLines = [];
-        var review = $('scanReviewCard');
-        if (review) review.style.display = 'none';
-        clearPreview();
-        showError('');
-        setStatus(false);
+        resetScanUi();
         return pdfs;
     }
 
+    function clearPdfCache() {
+        Object.keys(pdfCache).forEach(function (key) {
+            var doc = pdfCache[key];
+            if (doc && typeof doc.destroy === 'function') {
+                try { doc.destroy(); } catch (e) { /* ignore */ }
+            }
+        });
+        pdfCache = {};
+    }
+
+    async function getPdf(file) {
+        var key = fileKey(file);
+        if (!pdfCache[key]) {
+            pdfCache[key] = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+        }
+        return pdfCache[key];
+    }
+
     function clearPreview() {
+        focusSeq++;
         var preview = $('scanPdfPreview');
         var host = $('scanPdfPreviewHost');
         if (host) host.innerHTML = '';
         if (preview) preview.style.display = 'none';
         lastPreview = null;
+        selectedHitIndex = null;
+        clearPdfCache();
     }
 
-    function drawHighlights(canvas, hits, scale) {
+    function hitsOnPage(fileName, pageNum) {
+        return lastHits.filter(function (h) {
+            return h.file === fileName && (h.page || 1) === pageNum;
+        });
+    }
+
+    function findPreviewItem(fileName) {
+        if (!lastPreview) return null;
+        for (var i = 0; i < lastPreview.length; i++) {
+            if (lastPreview[i].fileName === fileName) return lastPreview[i];
+        }
+        return lastPreview[0] || null;
+    }
+
+    function drawHighlights(canvas, hits, scale, selectedHit, origin) {
         if (!canvas || !hits || !hits.length) return;
         var ctx = canvas.getContext('2d');
+        var ox = (origin && origin.x) || 0;
+        var oy = (origin && origin.y) || 0;
+        var lw = (origin && origin.lineWidth) || 1;
+        var zoomStyle = !!(origin && origin.zoomStyle);
         ctx.save();
-        ctx.fillStyle = 'rgba(255, 193, 7, 0.38)';
-        ctx.strokeStyle = 'rgba(200, 150, 0, 0.9)';
-        ctx.lineWidth = 1.5;
-        hits.forEach(function (hit) {
+        function paint(hit, selected) {
             var b = hit.bbox;
             if (!b) return;
-            var x = b.x * scale;
-            var y = b.y * scale;
+            var x = (b.x - ox) * scale;
+            var y = (b.y - oy) * scale;
             var w = Math.max(8, b.w * scale);
             var h = Math.max(8, b.h * scale);
+            if (zoomStyle) {
+                if (!selected) return;
+                ctx.setLineDash([5 * lw, 4 * lw]);
+                ctx.strokeStyle = '#b71c1c';
+                ctx.lineWidth = Math.max(1, 1.15 * 1.7 * lw);
+                ctx.strokeRect(x, y, w, h);
+                return;
+            }
+            ctx.setLineDash([]);
+            ctx.fillStyle = selected ? 'rgba(255, 120, 0, 0.45)' : 'rgba(255, 193, 7, 0.38)';
+            ctx.strokeStyle = selected ? 'rgba(220, 80, 0, 1)' : 'rgba(200, 150, 0, 0.9)';
+            ctx.lineWidth = (selected ? 3 : 1.5) * lw;
             ctx.fillRect(x, y, w, h);
             ctx.strokeRect(x, y, w, h);
+        }
+        if (zoomStyle) {
+            if (selectedHit) paint(selectedHit, true);
+            ctx.restore();
+            return;
+        }
+        hits.forEach(function (hit) {
+            if (hit !== selectedHit) paint(hit, false);
         });
+        if (selectedHit) paint(selectedHit, true);
         ctx.restore();
     }
 
-    async function renderPreview(file, extractScale, pageHits) {
-        var pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
-        var page = await pdf.getPage(1);
+    function redrawHighlights(item, selectedHit) {
+        if (!item || !item.canvas || !item.pageImage || item.cropped) return;
+        var scale = item.previewScale / (item.extractScale || 1);
+        item.canvas.getContext('2d').putImageData(item.pageImage, 0, 0);
+        drawHighlights(item.canvas, hitsOnPage(item.fileName, item.page), scale, selectedHit);
+    }
+
+    function resetZoom(item) {
+        if (!item) return;
+        item.zoomed = false;
+        if (item.zoomEl) item.zoomEl.style.transform = '';
+        if (item.viewportEl) {
+            item.viewportEl.classList.remove('is-zoomed', 'is-cropped');
+            item.viewportEl.style.height = '';
+        }
+    }
+
+    function restoreOverview(item) {
+        if (!item) return;
+        if (item.cropped && item.overviewCanvas) {
+            item.canvas = item.overviewCanvas;
+            if (item.zoomEl) {
+                item.zoomEl.innerHTML = '';
+                item.zoomEl.appendChild(item.overviewCanvas);
+            }
+            item.cropped = false;
+        }
+        resetZoom(item);
+    }
+
+    function computeFocusView(item, bbox, vw, vh) {
+        var bw = Math.max(8, bbox.w);
+        var bh = Math.max(8, bbox.h);
+        var worldW = bw * 4;
+        var worldH = bh * 4;
+        var aspect = vw / vh;
+        if (worldW / worldH < aspect) worldW = worldH * aspect;
+        else worldH = worldW / aspect;
+
+        var cx = bbox.x + bbox.w / 2;
+        var cy = bbox.y + bbox.h / 2;
+        return {
+            left: cx - worldW / 2,
+            top: cy - worldH / 2,
+            worldW: worldW,
+            worldH: worldH
+        };
+    }
+
+    function zoomToBbox(item, bbox) {
+        if (!item || !item.canvas || !item.viewportEl || !item.zoomEl || !bbox) {
+            resetZoom(item);
+            return false;
+        }
+
+        resetZoom(item);
+
+        var canvas = item.canvas;
+        var vp = item.viewportEl;
+        var vpRect = vp.getBoundingClientRect();
+        var canvasRect = canvas.getBoundingClientRect();
+        var vw = vpRect.width;
+        var vh = vpRect.height;
+        if (!vw || !vh || !canvas.width || !canvasRect.width) return false;
+
+        var view = computeFocusView(item, bbox, vw, vh);
+        var cssScale = canvasRect.width / canvas.width;
+        var s = item.previewScale / (item.extractScale || 1);
+        var dispW = view.worldW * s * cssScale;
+        var zoom = dispW > 0 ? vw / dispW : 1;
+        zoom = Math.max(1, Math.min(40, zoom));
+        if (zoom <= 1.05) return false;
+
+        var viewCx = view.left + view.worldW / 2;
+        var viewCy = view.top + view.worldH / 2;
+        var cx = (canvasRect.left - vpRect.left) + viewCx * s * cssScale;
+        var cy = (canvasRect.top - vpRect.top) + viewCy * s * cssScale;
+        var tx = vw / 2 - cx * zoom;
+        var ty = vh / 2 - cy * zoom;
+
+        vp.style.height = Math.round(vh) + 'px';
+        item.zoomEl.style.transform = 'translate(' + tx + 'px, ' + ty + 'px) scale(' + zoom + ')';
+        item.viewportEl.classList.add('is-zoomed');
+        item.zoomed = true;
+        return true;
+    }
+
+    async function paintZoomedCrop(item, hit, token) {
+        if (!item || !hit || !hit.bbox || !item.viewportEl) return;
+        var vp = item.viewportEl;
+        var vw = vp.clientWidth;
+        var vh = vp.clientHeight;
+        if (!vw || !vh) return;
+
+        var view = computeFocusView(item, hit.bbox, vw, vh);
+        var dpr = Math.min(window.devicePixelRatio || 1, 2);
+        var canvasW = Math.max(1, Math.round(vw * dpr));
+        var canvasH = Math.max(1, Math.round(vh * dpr));
+        var scale = canvasW / view.worldW;
+
+        var pdf = await getPdf(item.file);
+        if (token != null && token !== focusSeq) return;
+        var page = await pdf.getPage(item.page);
+        if (token != null && token !== focusSeq) return;
+        var viewport = page.getViewport({ scale: scale });
+        var canvas = document.createElement('canvas');
+        canvas.width = canvasW;
+        canvas.height = canvasH;
+        canvas.className = 'scan-pdf-preview-canvas';
+        var ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvasW, canvasH);
+        await page.render({
+            canvasContext: ctx,
+            viewport: viewport,
+            transform: [1, 0, 0, 1, -view.left * scale, -view.top * scale],
+            background: '#ffffff'
+        }).promise;
+        if (token != null && token !== focusSeq) return;
+
+        drawHighlights(canvas, [hit], scale, hit, {
+            x: view.left,
+            y: view.top,
+            lineWidth: dpr,
+            zoomStyle: true
+        });
+
+        if (!item.overviewCanvas && item.canvas) item.overviewCanvas = item.canvas;
+        item.canvas = canvas;
+        item.cropped = true;
+        if (item.zoomEl) {
+            item.zoomEl.style.transform = '';
+            item.zoomEl.innerHTML = '';
+            item.zoomEl.appendChild(canvas);
+        }
+        vp.style.height = Math.round(vh) + 'px';
+        vp.classList.add('is-zoomed', 'is-cropped');
+        item.zoomed = true;
+    }
+
+    async function paintPreviewPage(item, pageNum, selectedHit) {
+        var pdf = await getPdf(item.file);
+        var page = await pdf.getPage(pageNum);
         var base = page.getViewport({ scale: 1 });
         var previewScale = Math.min(2.2, Math.max(0.8, 1400 / base.width));
         var viewport = page.getViewport({ scale: previewScale });
@@ -146,22 +348,151 @@
         ctx.fillStyle = '#ffffff';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         await page.render({ canvasContext: ctx, viewport: viewport }).promise;
-        var scale = previewScale / (extractScale || 1);
-        drawHighlights(canvas, pageHits, scale);
 
+        var pageImage = null;
+        try {
+            pageImage = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        } catch (e) {
+            pageImage = null;
+        }
+
+        item.previewScale = previewScale;
+        item.page = pageNum;
+        item.pageWidth = base.width;
+        item.pageHeight = base.height;
+        item.canvas = canvas;
+        item.overviewCanvas = canvas;
+        item.cropped = false;
+        item.pageImage = pageImage;
+        item.label.textContent = item.fileName + ' · s. ' + pageNum;
+
+        if (!item.zoomEl) {
+            item.zoomEl = document.createElement('div');
+            item.zoomEl.className = 'scan-pdf-preview-zoom';
+            item.viewportEl.appendChild(item.zoomEl);
+        }
+        item.zoomEl.innerHTML = '';
+        item.zoomEl.appendChild(canvas);
+        resetZoom(item);
+
+        var scale = previewScale / (item.extractScale || 1);
+        drawHighlights(canvas, hitsOnPage(item.fileName, pageNum), scale, selectedHit);
+    }
+
+    async function createPreviewItem(file, extractScale, pageNum) {
         var wrap = document.createElement('div');
         wrap.className = 'scan-pdf-preview-item';
         var label = document.createElement('div');
         label.className = 'scan-pdf-preview-name';
-        label.textContent = file.name;
+        var viewportEl = document.createElement('div');
+        viewportEl.className = 'scan-pdf-preview-viewport';
         wrap.appendChild(label);
-        wrap.appendChild(canvas);
-        return wrap;
+        wrap.appendChild(viewportEl);
+
+        var item = {
+            fileName: file.name,
+            file: file,
+            wrap: wrap,
+            canvas: null,
+            viewportEl: viewportEl,
+            zoomEl: null,
+            label: label,
+            page: pageNum,
+            previewScale: 1,
+            extractScale: extractScale,
+            pageImage: null,
+            overviewCanvas: null,
+            cropped: false,
+            pageWidth: 0,
+            pageHeight: 0,
+            zoomed: false
+        };
+        await paintPreviewPage(item, pageNum, null);
+        return item;
+    }
+
+    function updateSelectedRow() {
+        var host = $('foundList');
+        if (!host) return;
+        var rows = host.querySelectorAll('[data-hit-index]');
+        for (var i = 0; i < rows.length; i++) {
+            var row = rows[i];
+            var on = Number(row.getAttribute('data-hit-index')) === selectedHitIndex;
+            row.classList.toggle('is-selected', on);
+            row.setAttribute('aria-pressed', on ? 'true' : 'false');
+        }
+    }
+
+    function resetPreviewFocus() {
+        selectedHitIndex = null;
+        updateSelectedRow();
+        if (!lastPreview) return;
+        lastPreview.forEach(function (item) {
+            restoreOverview(item);
+            redrawHighlights(item, null);
+        });
+    }
+
+    async function focusHit(index) {
+        if (index < 0 || index >= lastHits.length) return;
+        if (selectedHitIndex === index) {
+            resetPreviewFocus();
+            return;
+        }
+
+        selectedHitIndex = index;
+        updateSelectedRow();
+
+        var hit = lastHits[index];
+        var item = findPreviewItem(hit.file);
+        if (!item) return;
+
+        var token = ++focusSeq;
+        var pageNum = hit.page || 1;
+        var selectedHit = hit;
+
+        if (lastPreview) {
+            lastPreview.forEach(function (other) {
+                if (other !== item) restoreOverview(other);
+            });
+        }
+
+        if (item.cropped) restoreOverview(item);
+
+        if (item.page !== pageNum || !item.pageImage) {
+            await paintPreviewPage(item, pageNum, hit.bbox ? null : selectedHit);
+            if (token !== focusSeq) return;
+        } else if (!hit.bbox) {
+            redrawHighlights(item, selectedHit);
+        }
+
+        if (hit.bbox && item.pageImage && item.canvas && !item.cropped) {
+            item.canvas.getContext('2d').putImageData(item.pageImage, 0, 0);
+        }
+
+        var previewCard = $('scanPdfPreview');
+        if (previewCard) previewCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        if (item.wrap) item.wrap.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+        requestAnimationFrame(function () {
+            if (token !== focusSeq) return;
+            if (!hit.bbox) {
+                restoreOverview(item);
+                return;
+            }
+            var didZoom = zoomToBbox(item, hit.bbox);
+            if (!didZoom) {
+                redrawHighlights(item, selectedHit);
+                return;
+            }
+            paintZoomedCrop(item, hit, token).catch(function (err) {
+                console.error(err);
+            });
+        });
     }
 
     async function extractFile(file, extractScale) {
-        var buf = await file.arrayBuffer();
-        var pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+        var pdf = await getPdf(file);
         var items = [];
         for (var p = 1; p <= pdf.numPages; p++) {
             var page = await pdf.getPage(p);
@@ -227,6 +558,13 @@
             var stacks = FS.itemsToStacks(allItems);
             var found = FS.findMatches(queries, lines, stacks);
 
+            lastHits = [];
+            found.results.forEach(function (r) {
+                r.hits.forEach(function (h) {
+                    lastHits.push(h);
+                });
+            });
+
             setStatus(true, 'Piirretään esikatselu…', 94);
             var host = $('scanPdfPreviewHost');
             var preview = $('scanPdfPreview');
@@ -234,21 +572,15 @@
                 host.innerHTML = '';
                 var rendered = [];
                 for (var p = 0; p < selectedFiles.length; p++) {
-                    var previewFile = selectedFiles[p];
-                    var pageHits = [];
-                    found.results.forEach(function (r) {
-                        r.hits.forEach(function (h) {
-                            if (h.file === previewFile.name && h.page === 1) pageHits.push(h);
-                        });
-                    });
-                    host.appendChild(await renderPreview(previewFile, extractScale, pageHits));
-                    rendered.push({ fileName: previewFile.name });
+                    var item = await createPreviewItem(selectedFiles[p], extractScale, 1);
+                    host.appendChild(item.wrap);
+                    rendered.push(item);
                 }
                 preview.style.display = '';
                 lastPreview = rendered;
             }
 
-            renderResults(found, selectedFiles.length, warnings);
+            renderResults(found, selectedFiles.length);
             setStatus(false);
             if (warnings.length) {
                 showError(warnings.join(' · '));
@@ -260,15 +592,9 @@
         }
     }
 
-    function renderResults(found, fileCount, warnings) {
-        var hitCount = 0;
-        lastFoundLines = [];
-        found.results.forEach(function (r) {
-            r.hits.forEach(function (h) {
-                hitCount++;
-                lastFoundLines.push(h.full);
-            });
-        });
+    function renderResults(found, fileCount) {
+        lastFoundLines = lastHits.map(function (h) { return h.full; });
+        var hitCount = lastHits.length;
 
         $('scanSummaryBadge').textContent =
             hitCount + ' osumaa · ' + found.missing.length + ' puuttuu · ' +
@@ -278,12 +604,11 @@
         if (!hitCount) {
             foundHost.innerHTML = '<div class="result-empty">Ei osumia.</div>';
         } else {
-            foundHost.innerHTML = found.results.map(function (r) {
-                return r.hits.map(function (h) {
-                    var meta = escapeHtml(h.file || '') + ' · s. ' + (h.page || 1);
-                    return '<div class="result-row"><span class="result-text">' +
-                        escapeHtml(h.full) + '</span><span class="result-meta">' + meta + '</span></div>';
-                }).join('');
+            foundHost.innerHTML = lastHits.map(function (h, i) {
+                var meta = escapeHtml(h.file || '') + ' · s. ' + (h.page || 1);
+                return '<div class="result-row result-row-hit" role="button" tabindex="0" data-hit-index="' +
+                    i + '" aria-pressed="false"><span class="result-text">' +
+                    escapeHtml(h.full) + '</span> <span class="result-meta">' + meta + '</span></div>';
             }).join('');
         }
 
@@ -365,25 +690,45 @@
         }
     }
 
+    function bindFoundList() {
+        var foundHost = $('foundList');
+        if (!foundHost || foundHost.dataset.bound) return;
+        foundHost.addEventListener('click', function (e) {
+            var row = e.target.closest('[data-hit-index]');
+            if (!row) return;
+            focusHit(Number(row.getAttribute('data-hit-index')));
+        });
+        foundHost.addEventListener('keydown', function (e) {
+            var row = e.target.closest('[data-hit-index]');
+            if (!row) return;
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                focusHit(Number(row.getAttribute('data-hit-index')));
+            }
+        });
+        foundHost.dataset.bound = '1';
+    }
+
     function clearAll() {
         selectedFiles = [];
-        lastFoundLines = [];
         $('nameListInput').value = '';
         $('scannerFileInput').value = '';
-        $('scanReviewCard').style.display = 'none';
         renderFileList();
-        clearPreview();
-        showError('');
-        setStatus(false);
+        resetScanUi();
     }
 
     function init() {
         bindDropzone();
+        bindFoundList();
         $('scanBtn').addEventListener('click', runScan);
         $('clearBtn').addEventListener('click', clearAll);
         $('copyLinesBtn').addEventListener('click', function () {
             copyText(lastFoundLines.join('\n'), $('copyLinesBtn'));
         });
+        var resetBtn = $('previewResetBtn');
+        if (resetBtn) {
+            resetBtn.addEventListener('click', resetPreviewFocus);
+        }
         var fileList = $('scannerFileList');
         if (fileList && !fileList.dataset.bound) {
             fileList.addEventListener('click', function (e) {
