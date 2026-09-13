@@ -3,10 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Pohjapiirustus-skanneri: etsi tuotekoodit vektori-PDF:stä ja täydennä huonetunnukset.">
+    <meta name="description" content="Pohjapiirustus-skanneri: etsi tuotekoodit vektori-PDF:stä ja rajaa tulokset.">
     <title>Pohjapiirustus-skanneri</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css?v=5">
+    <link rel="stylesheet" href="styles.css?v=10">
 </head>
 <body>
     <a href="#scannerScreen" class="skip-link">Siirry sisältöön</a>
@@ -41,10 +41,10 @@
                             class="form-control scanner-namelist"
                             id="nameListInput"
                             rows="6"
-                            placeholder="Yksi tuotekoodi per rivi, esim.&#10;tlo2 10+4x24 v"
+                            placeholder="Yksi tuotekoodi per rivi, esim.&#10;sikk2&#10;tluo&#10;10x21"
                             spellcheck="false"
                         ></textarea>
-                        <div class="form-text">Skanneri etsii jokaisen rivin pohjapiirustuksesta ja lisää perään huonetunnuksen.</div>
+                        <div class="form-text">Skanneri etsii nimilistan merkkijonot piirustuksesta ja merkitsee ne punaisella neliöllä. Venytä neliö haluttujen tietojen ympärille ja hyväksy rajaus jonoon.</div>
                     </div>
                     <div class="col-md-6 scanner-input-col">
                         <label class="form-label" for="scannerFileInput">Pohjapiirustukset</label>
@@ -84,6 +84,11 @@
                     <button type="button" class="btn btn-sm btn-outline-secondary" id="previewResetBtn">Koko sivu</button>
                 </div>
                 <div id="scanPdfPreviewHost" class="scan-pdf-preview-host"></div>
+                <div class="scan-pdf-preview-actions">
+                    <button type="button" class="btn btn-sm btn-primary" id="cropAcceptBtn">Hyväksy</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="cropSkipBtn">Ohita</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="cropPrevBtn">Edellinen</button>
+                </div>
             </div>
         </div>
 
@@ -99,9 +104,13 @@
                     </div>
                 </div>
 
-                <div class="mb-3">
-                    <div class="text-uppercase fw-bold result-section-label">Löytyneet</div>
+                <div id="pendingSection" class="mb-3">
+                    <div class="text-uppercase fw-bold result-section-label">Käsittelemättä</div>
                     <div id="foundList" class="result-list"></div>
+                </div>
+                <div id="queueSection" class="mb-3">
+                    <div class="text-uppercase fw-bold result-section-label">Hyväksytyt</div>
+                    <div id="queueList" class="result-list"></div>
                 </div>
                 <div id="missingSection" class="pt-3 border-top">
                     <div class="text-uppercase fw-bold result-section-label">Ei löytynyt</div>
@@ -118,7 +127,7 @@
           "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
       }
     </script>
-    <script src="floorplan-scanner.js?v=5"></script>
-    <script src="app.js?v=9"></script>
+    <script src="floorplan-scanner.js?v=17"></script>
+    <script src="app.js?v=17"></script>
 </body>
 </html>

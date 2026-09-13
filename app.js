@@ -1,16 +1,40 @@
 (function () {
     'use strict';
 
+    var HANDLE_CURSORS = {
+        nw: 'nwse-resize',
+        n: 'ns-resize',
+        ne: 'nesw-resize',
+        e: 'ew-resize',
+        se: 'nwse-resize',
+        s: 'ns-resize',
+        sw: 'nesw-resize',
+        w: 'ew-resize',
+        move: 'move'
+    };
+
     var selectedFiles = [];
-    var lastFoundLines = [];
-    var lastHits = [];
+    var lastItems = [];
+    var candidates = [];
+    var queue = [];
+    var lastMissing = [];
+    var lastFileCount = 0;
     var lastPreview = null;
-    var selectedHitIndex = null;
+    var activeIndex = null;
     var pdfCache = {};
     var focusSeq = 0;
+    var cropDrag = null;
 
     function $(id) {
         return document.getElementById(id);
+    }
+
+    function copyBBox(box) {
+        if (!box) return null;
+        if (window.FloorplanScanner && FloorplanScanner.copyBBox) {
+            return FloorplanScanner.copyBBox(box);
+        }
+        return { x: box.x, y: box.y, w: box.w, h: box.h };
     }
 
     function setStatus(on, text, pct) {
@@ -53,14 +77,19 @@
     }
 
     function resetScanUi() {
-        lastFoundLines = [];
-        lastHits = [];
-        selectedHitIndex = null;
+        lastItems = [];
+        candidates = [];
+        queue = [];
+        lastMissing = [];
+        lastFileCount = 0;
+        activeIndex = null;
+        cropDrag = null;
         var review = $('scanReviewCard');
         if (review) review.style.display = 'none';
         clearPreview();
         showError('');
         setStatus(false);
+        updateCropButtons();
     }
 
     function removeFile(index) {
@@ -127,19 +156,29 @@
         return pdfCache[key];
     }
 
+    function hideOverlays() {
+        if (!lastPreview) return;
+        lastPreview.forEach(function (item) {
+            if (item.overlayEl) item.overlayEl.style.display = 'none';
+        });
+    }
+
     function clearPreview() {
         focusSeq++;
+        cropDrag = null;
         var preview = $('scanPdfPreview');
         var host = $('scanPdfPreviewHost');
         if (host) host.innerHTML = '';
         if (preview) preview.style.display = 'none';
         lastPreview = null;
-        selectedHitIndex = null;
+        activeIndex = null;
         clearPdfCache();
     }
 
-    function hitsOnPage(fileName, pageNum) {
-        return lastHits.filter(function (h) {
+    function pendingOnPage(fileName, pageNum) {
+        return candidates.filter(function (h, i) {
+            if (i === activeIndex) return false;
+            if (h.status !== 'pending') return false;
             return h.file === fileName && (h.page || 1) === pageNum;
         });
     }
@@ -152,53 +191,35 @@
         return lastPreview[0] || null;
     }
 
-    function drawHighlights(canvas, hits, scale, selectedHit, origin) {
+    function drawHighlights(canvas, hits, scale, origin) {
         if (!canvas || !hits || !hits.length) return;
         var ctx = canvas.getContext('2d');
         var ox = (origin && origin.x) || 0;
         var oy = (origin && origin.y) || 0;
         var lw = (origin && origin.lineWidth) || 1;
-        var zoomStyle = !!(origin && origin.zoomStyle);
         ctx.save();
-        function paint(hit, selected) {
+        ctx.setLineDash([]);
+        ctx.fillStyle = 'rgba(255, 193, 7, 0.28)';
+        ctx.strokeStyle = 'rgba(200, 150, 0, 0.7)';
+        ctx.lineWidth = 1.25 * lw;
+        hits.forEach(function (hit) {
             var b = hit.bbox;
             if (!b) return;
             var x = (b.x - ox) * scale;
             var y = (b.y - oy) * scale;
             var w = Math.max(8, b.w * scale);
             var h = Math.max(8, b.h * scale);
-            if (zoomStyle) {
-                if (!selected) return;
-                ctx.setLineDash([5 * lw, 4 * lw]);
-                ctx.strokeStyle = '#b71c1c';
-                ctx.lineWidth = Math.max(1, 1.15 * 1.7 * lw);
-                ctx.strokeRect(x, y, w, h);
-                return;
-            }
-            ctx.setLineDash([]);
-            ctx.fillStyle = selected ? 'rgba(255, 120, 0, 0.45)' : 'rgba(255, 193, 7, 0.38)';
-            ctx.strokeStyle = selected ? 'rgba(220, 80, 0, 1)' : 'rgba(200, 150, 0, 0.9)';
-            ctx.lineWidth = (selected ? 3 : 1.5) * lw;
             ctx.fillRect(x, y, w, h);
             ctx.strokeRect(x, y, w, h);
-        }
-        if (zoomStyle) {
-            if (selectedHit) paint(selectedHit, true);
-            ctx.restore();
-            return;
-        }
-        hits.forEach(function (hit) {
-            if (hit !== selectedHit) paint(hit, false);
         });
-        if (selectedHit) paint(selectedHit, true);
         ctx.restore();
     }
 
-    function redrawHighlights(item, selectedHit) {
+    function redrawHighlights(item) {
         if (!item || !item.canvas || !item.pageImage || item.cropped) return;
         var scale = item.previewScale / (item.extractScale || 1);
         item.canvas.getContext('2d').putImageData(item.pageImage, 0, 0);
-        drawHighlights(item.canvas, hitsOnPage(item.fileName, item.page), scale, selectedHit);
+        drawHighlights(item.canvas, pendingOnPage(item.fileName, item.page), scale);
     }
 
     function resetZoom(item) {
@@ -211,27 +232,56 @@
         }
     }
 
+    function copyView(view) {
+        if (!view) return null;
+        return { left: view.left, top: view.top, worldW: view.worldW, worldH: view.worldH };
+    }
+
+    function sameView(a, b) {
+        return !!(a && b &&
+            a.left === b.left && a.top === b.top &&
+            a.worldW === b.worldW && a.worldH === b.worldH);
+    }
+
+    function clearWheelZoom(item) {
+        if (!item) return;
+        if (item.wheelTimer) {
+            clearTimeout(item.wheelTimer);
+            item.wheelTimer = null;
+        }
+        item.wheelAnchor = null;
+        item.wheelFrac = null;
+        item.pendingView = null;
+    }
+
     function restoreOverview(item) {
         if (!item) return;
+        clearWheelZoom(item);
+        if (item.zoomRenderTask && typeof item.zoomRenderTask.cancel === 'function') {
+            try { item.zoomRenderTask.cancel(); } catch (e) { /* ignore */ }
+            item.zoomRenderTask = null;
+        }
         if (item.cropped && item.overviewCanvas) {
             item.canvas = item.overviewCanvas;
             if (item.zoomEl) {
                 item.zoomEl.innerHTML = '';
                 item.zoomEl.appendChild(item.overviewCanvas);
             }
+            if (item.overlayEl) item.viewportEl.appendChild(item.overlayEl);
             item.cropped = false;
+            item.focusView = null;
         }
         resetZoom(item);
     }
 
     function computeFocusView(item, bbox, vw, vh) {
-        var bw = Math.max(8, bbox.w);
-        var bh = Math.max(8, bbox.h);
-        var worldW = bw * 4;
-        var worldH = bh * 4;
-        var aspect = vw / vh;
-        if (worldW / worldH < aspect) worldW = worldH * aspect;
-        else worldH = worldW / aspect;
+        var bh = Math.max(8, bbox.h || 0);
+        var worldH = bh / 0.18;
+        var worldW = worldH * (vw / Math.max(vh, 1));
+        if (item && item.pageHeight) worldH = Math.min(worldH, item.pageHeight);
+        if (item && item.pageWidth) worldW = Math.min(worldW, Math.max(item.pageWidth, worldH * vw / Math.max(vh, 1)));
+        worldW = Math.max(worldW, 24);
+        worldH = Math.max(worldH, 24);
 
         var cx = bbox.x + bbox.w / 2;
         var cy = bbox.y + bbox.h / 2;
@@ -243,98 +293,418 @@
         };
     }
 
-    function zoomToBbox(item, bbox) {
-        if (!item || !item.canvas || !item.viewportEl || !item.zoomEl || !bbox) {
-            resetZoom(item);
-            return false;
-        }
-
-        resetZoom(item);
-
-        var canvas = item.canvas;
-        var vp = item.viewportEl;
-        var vpRect = vp.getBoundingClientRect();
-        var canvasRect = canvas.getBoundingClientRect();
-        var vw = vpRect.width;
-        var vh = vpRect.height;
-        if (!vw || !vh || !canvas.width || !canvasRect.width) return false;
-
-        var view = computeFocusView(item, bbox, vw, vh);
-        var cssScale = canvasRect.width / canvas.width;
-        var s = item.previewScale / (item.extractScale || 1);
-        var dispW = view.worldW * s * cssScale;
-        var zoom = dispW > 0 ? vw / dispW : 1;
-        zoom = Math.max(1, Math.min(40, zoom));
-        if (zoom <= 1.05) return false;
-
-        var viewCx = view.left + view.worldW / 2;
-        var viewCy = view.top + view.worldH / 2;
-        var cx = (canvasRect.left - vpRect.left) + viewCx * s * cssScale;
-        var cy = (canvasRect.top - vpRect.top) + viewCy * s * cssScale;
-        var tx = vw / 2 - cx * zoom;
-        var ty = vh / 2 - cy * zoom;
-
-        vp.style.height = Math.round(vh) + 'px';
-        item.zoomEl.style.transform = 'translate(' + tx + 'px, ' + ty + 'px) scale(' + zoom + ')';
-        item.viewportEl.classList.add('is-zoomed');
-        item.zoomed = true;
-        return true;
+    function measureZoomViewport(item) {
+        var host = $('scanPdfPreviewHost');
+        var vp = item && item.viewportEl;
+        var vw = Math.round((host && host.clientWidth) || (vp && vp.clientWidth) || 0);
+        var vh = Math.max(240, Math.round(window.innerHeight * 0.55));
+        return { vw: vw, vh: vh };
     }
 
-    async function paintZoomedCrop(item, hit, token) {
-        if (!item || !hit || !hit.bbox || !item.viewportEl) return;
-        var vp = item.viewportEl;
-        var vw = vp.clientWidth;
-        var vh = vp.clientHeight;
-        if (!vw || !vh) return;
+    function pageFitView(item) {
+        var size = measureZoomViewport(item);
+        var vw = Math.max(size.vw, 1);
+        var vh = Math.max(size.vh, 1);
+        var pw = item.pageWidth || 1;
+        var ph = item.pageHeight || 1;
+        var aspect = vw / vh;
+        var worldW = pw;
+        var worldH = worldW / aspect;
+        if (worldH < ph) {
+            worldH = ph;
+            worldW = worldH * aspect;
+        }
+        return {
+            left: (pw - worldW) / 2,
+            top: (ph - worldH) / 2,
+            worldW: worldW,
+            worldH: worldH
+        };
+    }
 
-        var view = computeFocusView(item, hit.bbox, vw, vh);
+    function clientToPdf(item, clientX, clientY) {
+        var canvas = item && item.canvas;
+        if (!canvas) return null;
+        var rect = canvas.getBoundingClientRect();
+        if (!rect.width || !rect.height) return null;
+        if (item.cropped && item.focusView) {
+            return {
+                x: item.focusView.left + (clientX - rect.left) / rect.width * item.focusView.worldW,
+                y: item.focusView.top + (clientY - rect.top) / rect.height * item.focusView.worldH
+            };
+        }
+        var s = item.previewScale / (item.extractScale || 1);
+        return {
+            x: (clientX - rect.left) / rect.width * canvas.width / s,
+            y: (clientY - rect.top) / rect.height * canvas.height / s
+        };
+    }
+
+    function visiblePdfView(item) {
+        if (item.cropped && item.focusView) return copyView(item.focusView);
+        var canvas = item.canvas;
+        var vp = item.viewportEl;
+        if (!canvas || !vp) return pageFitView(item);
+        var cRect = canvas.getBoundingClientRect();
+        var vRect = vp.getBoundingClientRect();
+        if (!cRect.width || !cRect.height) return pageFitView(item);
+        var left = Math.max(cRect.left, vRect.left);
+        var top = Math.max(cRect.top, vRect.top);
+        var right = Math.min(cRect.right, vRect.right);
+        var bottom = Math.min(cRect.bottom, vRect.bottom);
+        if (right <= left || bottom <= top) return pageFitView(item);
+        var tl = clientToPdf(item, left, top);
+        var br = clientToPdf(item, right, bottom);
+        if (!tl || !br) return pageFitView(item);
+        return {
+            left: tl.x,
+            top: tl.y,
+            worldW: Math.max(1, br.x - tl.x),
+            worldH: Math.max(1, br.y - tl.y)
+        };
+    }
+
+    function wheelFactor(e) {
+        var notches;
+        if (e.deltaMode === 1) notches = e.deltaY;
+        else if (e.deltaMode === 2) notches = e.deltaY * 3;
+        else notches = e.deltaY / 100;
+        var factor = Math.pow(1.15, -notches);
+        return Math.min(2, Math.max(0.5, factor));
+    }
+
+    function applyWheelZoom(item, e) {
+        if (!item || !item.canvas) return;
+        var factor = wheelFactor(e);
+        if (!item.cropped && !item.pendingView && factor <= 1) return;
+
+        var current = item.pendingView || visiblePdfView(item);
+        if (!current || !current.worldW || !current.worldH) return;
+
+        if (!item.wheelAnchor) {
+            item.wheelAnchor = clientToPdf(item, e.clientX, e.clientY);
+            if (!item.wheelAnchor) return;
+            var vRect = item.viewportEl.getBoundingClientRect();
+            item.wheelFrac = {
+                x: (e.clientX - vRect.left) / Math.max(vRect.width, 1),
+                y: (e.clientY - vRect.top) / Math.max(vRect.height, 1)
+            };
+        }
+        var anchor = item.wheelAnchor;
+        var fx = item.wheelFrac ? item.wheelFrac.x : 0.5;
+        var fy = item.wheelFrac ? item.wheelFrac.y : 0.5;
+        if (!isFinite(fx)) fx = 0.5;
+        if (!isFinite(fy)) fy = 0.5;
+
+        var size = measureZoomViewport(item);
+        var aspect = Math.max(size.vw, 1) / Math.max(size.vh, 1);
+        var newH = current.worldH / factor;
+        var fit = pageFitView(item);
+        if (newH >= fit.worldH - 0.5) {
+            restoreOverview(item);
+            redrawHighlights(item);
+            requestAnimationFrame(syncActiveOverlay);
+            return;
+        }
+        newH = Math.max(24, newH);
+
+        item.pendingView = {
+            left: anchor.x - fx * newH * aspect,
+            top: anchor.y - fy * newH,
+            worldW: newH * aspect,
+            worldH: newH
+        };
+        scheduleZoomRender(item);
+    }
+
+    function scheduleZoomRender(item) {
+        if (item.wheelTimer) clearTimeout(item.wheelTimer);
+        item.wheelTimer = setTimeout(function () {
+            item.wheelTimer = null;
+            var view = copyView(item.pendingView);
+            if (!view) return;
+            var token = ++focusSeq;
+            paintZoomedView(item, view, token).then(function (ok) {
+                if (token !== focusSeq) return;
+                if (item.pendingView && !sameView(item.pendingView, view)) {
+                    scheduleZoomRender(item);
+                    return;
+                }
+                item.pendingView = null;
+                item.wheelAnchor = null;
+                item.wheelFrac = null;
+                if (ok) syncActiveOverlay();
+            });
+        }, 120);
+    }
+
+    function bindWheelZoom(item) {
+        if (!item || !item.viewportEl || item.wheelBound) return;
+        item.wheelBound = true;
+        item.viewportEl.addEventListener('wheel', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (cropDrag || document.body.classList.contains('is-cropping')) return;
+            applyWheelZoom(item, e);
+        }, { passive: false });
+    }
+
+    async function paintZoomedView(item, view, token) {
+        if (!item || !view || !item.viewportEl) return false;
+        var vp = item.viewportEl;
+        var size = measureZoomViewport(item);
+        var vw = size.vw;
+        var vh = size.vh;
+        if (!vw || !vh) return false;
+
         var dpr = Math.min(window.devicePixelRatio || 1, 2);
         var canvasW = Math.max(1, Math.round(vw * dpr));
         var canvasH = Math.max(1, Math.round(vh * dpr));
         var scale = canvasW / view.worldW;
+        if (!isFinite(scale) || scale <= 0) return false;
 
-        var pdf = await getPdf(item.file);
-        if (token != null && token !== focusSeq) return;
-        var page = await pdf.getPage(item.page);
-        if (token != null && token !== focusSeq) return;
-        var viewport = page.getViewport({ scale: scale });
-        var canvas = document.createElement('canvas');
-        canvas.width = canvasW;
-        canvas.height = canvasH;
-        canvas.className = 'scan-pdf-preview-canvas';
-        var ctx = canvas.getContext('2d');
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0, 0, canvasW, canvasH);
-        await page.render({
-            canvasContext: ctx,
-            viewport: viewport,
-            transform: [1, 0, 0, 1, -view.left * scale, -view.top * scale],
-            background: '#ffffff'
-        }).promise;
-        if (token != null && token !== focusSeq) return;
+        try {
+            var pdf = await getPdf(item.file);
+            if (token != null && token !== focusSeq) return false;
+            var page = await pdf.getPage(item.page);
+            if (token != null && token !== focusSeq) return false;
 
-        drawHighlights(canvas, [hit], scale, hit, {
-            x: view.left,
-            y: view.top,
-            lineWidth: dpr,
-            zoomStyle: true
-        });
+            if (item.zoomRenderTask && typeof item.zoomRenderTask.cancel === 'function') {
+                try { item.zoomRenderTask.cancel(); } catch (e) { /* ignore */ }
+                item.zoomRenderTask = null;
+            }
 
-        if (!item.overviewCanvas && item.canvas) item.overviewCanvas = item.canvas;
-        item.canvas = canvas;
-        item.cropped = true;
-        if (item.zoomEl) {
-            item.zoomEl.style.transform = '';
-            item.zoomEl.innerHTML = '';
-            item.zoomEl.appendChild(canvas);
+            var viewport = page.getViewport({ scale: 1 });
+            var canvas = document.createElement('canvas');
+            canvas.width = canvasW;
+            canvas.height = canvasH;
+            canvas.className = 'scan-pdf-preview-canvas';
+            var ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, canvasW, canvasH);
+
+            var task = page.render({
+                canvasContext: ctx,
+                viewport: viewport,
+                transform: [scale, 0, 0, scale, -view.left * scale, -view.top * scale],
+                background: '#ffffff'
+            });
+            item.zoomRenderTask = task;
+            await task.promise;
+            item.zoomRenderTask = null;
+            if (token != null && token !== focusSeq) return false;
+
+            drawHighlights(canvas, pendingOnPage(item.fileName, item.page), scale, {
+                x: view.left,
+                y: view.top,
+                lineWidth: dpr
+            });
+
+            if (!item.overviewCanvas && item.canvas) item.overviewCanvas = item.canvas;
+            item.canvas = canvas;
+            item.cropped = true;
+            item.focusView = copyView(view);
+            if (item.zoomEl) {
+                item.zoomEl.style.transform = '';
+                item.zoomEl.innerHTML = '';
+                item.zoomEl.appendChild(canvas);
+            }
+            if (item.overlayEl) item.viewportEl.appendChild(item.overlayEl);
+            vp.style.height = Math.round(vh) + 'px';
+            vp.classList.add('is-zoomed', 'is-cropped');
+            item.zoomed = true;
+            return true;
+        } catch (err) {
+            item.zoomRenderTask = null;
+            if (err && (err.name === 'RenderingCancelledException' || /cancel/i.test(err.message || ''))) {
+                return false;
+            }
+            console.error(err);
+            restoreOverview(item);
+            return false;
         }
-        vp.style.height = Math.round(vh) + 'px';
-        vp.classList.add('is-zoomed', 'is-cropped');
-        item.zoomed = true;
     }
 
-    async function paintPreviewPage(item, pageNum, selectedHit) {
+    async function paintZoomedCrop(item, bbox, token) {
+        if (!item || !bbox || !item.viewportEl) return false;
+        var size = measureZoomViewport(item);
+        if (!size.vw || !size.vh) return false;
+        return paintZoomedView(item, computeFocusView(item, bbox, size.vw, size.vh), token);
+    }
+
+    function pdfToViewport(item, box) {
+        var canvas = item.canvas;
+        var vp = item.viewportEl;
+        var cRect = canvas.getBoundingClientRect();
+        var vRect = vp.getBoundingClientRect();
+        if (item.cropped && item.focusView) {
+            var view = item.focusView;
+            return {
+                left: (cRect.left - vRect.left) + ((box.x - view.left) / view.worldW) * cRect.width,
+                top: (cRect.top - vRect.top) + ((box.y - view.top) / view.worldH) * cRect.height,
+                w: (box.w / view.worldW) * cRect.width,
+                h: (box.h / view.worldH) * cRect.height
+            };
+        }
+        var s = item.previewScale / (item.extractScale || 1);
+        return {
+            left: (cRect.left - vRect.left) + (box.x * s / canvas.width) * cRect.width,
+            top: (cRect.top - vRect.top) + (box.y * s / canvas.height) * cRect.height,
+            w: (box.w * s / canvas.width) * cRect.width,
+            h: (box.h * s / canvas.height) * cRect.height
+        };
+    }
+
+    function clientDeltaToPdf(item, dxClient, dyClient) {
+        var canvas = item.canvas;
+        var rect = canvas.getBoundingClientRect();
+        if (!rect.width || !rect.height) return { x: 0, y: 0 };
+        if (item.cropped && item.focusView) {
+            return {
+                x: dxClient / rect.width * item.focusView.worldW,
+                y: dyClient / rect.height * item.focusView.worldH
+            };
+        }
+        if (!canvas.width) return { x: 0, y: 0 };
+        var s = item.previewScale / (item.extractScale || 1);
+        return {
+            x: dxClient / rect.width * canvas.width / s,
+            y: dyClient / rect.height * canvas.height / s
+        };
+    }
+
+    function clampCrop(box, item) {
+        var min = 8;
+        var pw = (item && item.pageWidth) || 10000;
+        var ph = (item && item.pageHeight) || 10000;
+        var x = box.x;
+        var y = box.y;
+        var w = Math.max(min, box.w);
+        var h = Math.max(min, box.h);
+        if (w > pw) w = pw;
+        if (h > ph) h = ph;
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        if (x + w > pw) x = Math.max(0, pw - w);
+        if (y + h > ph) y = Math.max(0, ph - h);
+        return { x: x, y: y, w: w, h: h };
+    }
+
+    function applyHandle(start, handle, dx, dy) {
+        var x1 = start.x;
+        var y1 = start.y;
+        var x2 = start.x + start.w;
+        var y2 = start.y + start.h;
+        if (handle === 'move') {
+            return { x: start.x + dx, y: start.y + dy, w: start.w, h: start.h };
+        }
+        if (handle.indexOf('w') >= 0) x1 += dx;
+        if (handle.indexOf('e') >= 0) x2 += dx;
+        if (handle.indexOf('n') >= 0) y1 += dy;
+        if (handle.indexOf('s') >= 0) y2 += dy;
+        var x = Math.min(x1, x2);
+        var y = Math.min(y1, y2);
+        return { x: x, y: y, w: Math.abs(x2 - x1), h: Math.abs(y2 - y1) };
+    }
+
+    function syncOverlay(item) {
+        if (!item || !item.overlayEl || !item.cropBoxEl || !item.canvas) return;
+        if (activeIndex == null || !candidates[activeIndex]) {
+            item.overlayEl.style.display = 'none';
+            return;
+        }
+        var cand = candidates[activeIndex];
+        if (cand.file !== item.fileName || (cand.page || 1) !== item.page || !cand.crop) {
+            item.overlayEl.style.display = 'none';
+            return;
+        }
+        var pos = pdfToViewport(item, cand.crop);
+        item.overlayEl.style.display = '';
+        item.cropBoxEl.style.left = pos.left + 'px';
+        item.cropBoxEl.style.top = pos.top + 'px';
+        item.cropBoxEl.style.width = Math.max(4, pos.w) + 'px';
+        item.cropBoxEl.style.height = Math.max(4, pos.h) + 'px';
+    }
+
+    function syncActiveOverlay() {
+        if (!lastPreview || activeIndex == null) {
+            hideOverlays();
+            return;
+        }
+        var cand = candidates[activeIndex];
+        lastPreview.forEach(function (item) {
+            if (cand && item.fileName === cand.file) syncOverlay(item);
+            else if (item.overlayEl) item.overlayEl.style.display = 'none';
+        });
+    }
+
+    function onCropMove(e) {
+        if (!cropDrag || activeIndex == null) return;
+        var cand = candidates[activeIndex];
+        var item = cropDrag.item;
+        if (!cand || !item) return;
+        var d = clientDeltaToPdf(item, e.clientX - cropDrag.startX, e.clientY - cropDrag.startY);
+        cand.crop = clampCrop(applyHandle(cropDrag.startBox, cropDrag.handle, d.x, d.y), item);
+        syncOverlay(item);
+    }
+
+    function endCropDrag(e) {
+        if (!cropDrag) return;
+        if (e && cropDrag.item && cropDrag.item.cropBoxEl && e.pointerId != null) {
+            try { cropDrag.item.cropBoxEl.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+        }
+        cropDrag = null;
+        document.body.classList.remove('is-cropping');
+    }
+
+    function bindCropPointer(item) {
+        var box = item.cropBoxEl;
+        box.addEventListener('pointerdown', function (e) {
+            if (activeIndex == null) return;
+            var cand = candidates[activeIndex];
+            if (!cand || !cand.crop) return;
+            e.preventDefault();
+            e.stopPropagation();
+            var handle = e.target.getAttribute('data-handle') || 'move';
+            box.setPointerCapture(e.pointerId);
+            document.body.classList.add('is-cropping');
+            cropDrag = {
+                item: item,
+                handle: handle,
+                startX: e.clientX,
+                startY: e.clientY,
+                startBox: copyBBox(cand.crop)
+            };
+        });
+        box.addEventListener('pointermove', function (e) {
+            if (!cropDrag || cropDrag.item !== item) return;
+            onCropMove(e);
+        });
+        box.addEventListener('pointerup', endCropDrag);
+        box.addEventListener('pointercancel', endCropDrag);
+    }
+
+    function createOverlay(item) {
+        var overlay = document.createElement('div');
+        overlay.className = 'crop-overlay';
+        overlay.style.display = 'none';
+        var box = document.createElement('div');
+        box.className = 'crop-box';
+        ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'].forEach(function (h) {
+            var el = document.createElement('div');
+            el.className = 'crop-handle crop-handle-' + h;
+            el.setAttribute('data-handle', h);
+            el.style.cursor = HANDLE_CURSORS[h];
+            box.appendChild(el);
+        });
+        overlay.appendChild(box);
+        item.viewportEl.appendChild(overlay);
+        item.overlayEl = overlay;
+        item.cropBoxEl = box;
+        bindCropPointer(item);
+    }
+
+    async function paintPreviewPage(item, pageNum) {
         var pdf = await getPdf(item.file);
         var page = await pdf.getPage(pageNum);
         var base = page.getViewport({ scale: 1 });
@@ -363,6 +733,7 @@
         item.canvas = canvas;
         item.overviewCanvas = canvas;
         item.cropped = false;
+        item.focusView = null;
         item.pageImage = pageImage;
         item.label.textContent = item.fileName + ' · s. ' + pageNum;
 
@@ -374,9 +745,11 @@
         item.zoomEl.innerHTML = '';
         item.zoomEl.appendChild(canvas);
         resetZoom(item);
+        if (!item.overlayEl) createOverlay(item);
+        else item.viewportEl.appendChild(item.overlayEl);
 
         var scale = previewScale / (item.extractScale || 1);
-        drawHighlights(canvas, hitsOnPage(item.fileName, pageNum), scale, selectedHit);
+        drawHighlights(canvas, pendingOnPage(item.fileName, pageNum), scale);
     }
 
     async function createPreviewItem(file, extractScale, pageNum) {
@@ -396,6 +769,8 @@
             canvas: null,
             viewportEl: viewportEl,
             zoomEl: null,
+            overlayEl: null,
+            cropBoxEl: null,
             label: label,
             page: pageNum,
             previewScale: 1,
@@ -403,53 +778,74 @@
             pageImage: null,
             overviewCanvas: null,
             cropped: false,
+            focusView: null,
+            zoomRenderTask: null,
             pageWidth: 0,
             pageHeight: 0,
-            zoomed: false
+            zoomed: false,
+            wheelTimer: null,
+            wheelAnchor: null,
+            wheelFrac: null,
+            pendingView: null,
+            wheelBound: false
         };
-        await paintPreviewPage(item, pageNum, null);
+        bindWheelZoom(item);
+        await paintPreviewPage(item, pageNum);
         return item;
     }
 
-    function updateSelectedRow() {
-        var host = $('foundList');
-        if (!host) return;
-        var rows = host.querySelectorAll('[data-hit-index]');
-        for (var i = 0; i < rows.length; i++) {
-            var row = rows[i];
-            var on = Number(row.getAttribute('data-hit-index')) === selectedHitIndex;
-            row.classList.toggle('is-selected', on);
-            row.setAttribute('aria-pressed', on ? 'true' : 'false');
-        }
-    }
-
-    function resetPreviewFocus() {
-        selectedHitIndex = null;
-        updateSelectedRow();
-        if (!lastPreview) return;
-        lastPreview.forEach(function (item) {
-            restoreOverview(item);
-            redrawHighlights(item, null);
+    function nextFrame() {
+        return new Promise(function (resolve) {
+            requestAnimationFrame(function () { resolve(); });
         });
     }
 
+    function updateSelectedRow() {
+        ['foundList', 'queueList'].forEach(function (id) {
+            var host = $(id);
+            if (!host) return;
+            var rows = host.querySelectorAll('[data-hit-index]');
+            for (var i = 0; i < rows.length; i++) {
+                var row = rows[i];
+                var on = Number(row.getAttribute('data-hit-index')) === activeIndex;
+                row.classList.toggle('is-selected', on);
+                row.setAttribute('aria-pressed', on ? 'true' : 'false');
+            }
+        });
+    }
+
+    function updateCropButtons() {
+        var has = activeIndex != null && !!candidates[activeIndex];
+        var accept = $('cropAcceptBtn');
+        var skip = $('cropSkipBtn');
+        var prev = $('cropPrevBtn');
+        if (accept) accept.disabled = !has;
+        if (skip) skip.disabled = !has;
+        if (prev) prev.disabled = !has || activeIndex <= 0;
+    }
+
+    function showOverview() {
+        if (!lastPreview) return;
+        lastPreview.forEach(function (item) {
+            restoreOverview(item);
+            redrawHighlights(item);
+        });
+        requestAnimationFrame(syncActiveOverlay);
+    }
+
     async function focusHit(index) {
-        if (index < 0 || index >= lastHits.length) return;
-        if (selectedHitIndex === index) {
-            resetPreviewFocus();
-            return;
-        }
+        if (index < 0 || index >= candidates.length) return;
 
-        selectedHitIndex = index;
+        activeIndex = index;
         updateSelectedRow();
+        updateCropButtons();
 
-        var hit = lastHits[index];
+        var hit = candidates[index];
         var item = findPreviewItem(hit.file);
         if (!item) return;
 
         var token = ++focusSeq;
         var pageNum = hit.page || 1;
-        var selectedHit = hit;
 
         if (lastPreview) {
             lastPreview.forEach(function (other) {
@@ -460,35 +856,97 @@
         if (item.cropped) restoreOverview(item);
 
         if (item.page !== pageNum || !item.pageImage) {
-            await paintPreviewPage(item, pageNum, hit.bbox ? null : selectedHit);
+            await paintPreviewPage(item, pageNum);
             if (token !== focusSeq) return;
-        } else if (!hit.bbox) {
-            redrawHighlights(item, selectedHit);
-        }
-
-        if (hit.bbox && item.pageImage && item.canvas && !item.cropped) {
-            item.canvas.getContext('2d').putImageData(item.pageImage, 0, 0);
+        } else {
+            redrawHighlights(item);
         }
 
         var previewCard = $('scanPdfPreview');
         if (previewCard) previewCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
         if (item.wrap) item.wrap.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 
-        requestAnimationFrame(function () {
+        await nextFrame();
+        if (token !== focusSeq) return;
+        var size = measureZoomViewport(item);
+        if (!size.vw) {
+            await nextFrame();
             if (token !== focusSeq) return;
-            if (!hit.bbox) {
-                restoreOverview(item);
-                return;
+        }
+        var box = hit.bbox || hit.crop;
+        if (box) {
+            var sharp = await paintZoomedCrop(item, box, token);
+            if (token !== focusSeq) return;
+            if (!sharp) {
+                await nextFrame();
+                if (token !== focusSeq) return;
+                sharp = await paintZoomedCrop(item, box, token);
+                if (token !== focusSeq) return;
             }
-            var didZoom = zoomToBbox(item, hit.bbox);
-            if (!didZoom) {
-                redrawHighlights(item, selectedHit);
-                return;
-            }
-            paintZoomedCrop(item, hit, token).catch(function (err) {
-                console.error(err);
-            });
+            if (!sharp) restoreOverview(item);
+        }
+        await nextFrame();
+        if (token !== focusSeq) return;
+        syncActiveOverlay();
+    }
+
+    function nextPending(from) {
+        var i;
+        for (i = from + 1; i < candidates.length; i++) {
+            if (candidates[i].status === 'pending') return i;
+        }
+        for (i = 0; i < candidates.length; i++) {
+            if (candidates[i].status === 'pending') return i;
+        }
+        return -1;
+    }
+
+    function acceptCrop() {
+        if (activeIndex == null || !candidates[activeIndex]) return;
+        var cand = candidates[activeIndex];
+        var crop = cand.crop || cand.bbox;
+        var text = window.FloorplanScanner && FloorplanScanner.textsInCrop
+            ? FloorplanScanner.textsInCrop(lastItems, crop, cand.file, cand.page || 1)
+            : '';
+        if (!text) text = cand.query || '';
+        cand.status = 'accepted';
+        cand.full = text;
+        cand.crop = copyBBox(crop);
+        queue = queue.filter(function (q) { return q.candidateIndex !== activeIndex; });
+        queue.push({
+            candidateIndex: activeIndex,
+            full: text,
+            file: cand.file,
+            page: cand.page || 1,
+            bbox: copyBBox(crop),
+            query: cand.query
         });
+        renderReview();
+        var next = nextPending(activeIndex);
+        if (next >= 0) focusHit(next);
+        else {
+            showOverview();
+            updateCropButtons();
+        }
+    }
+
+    function skipCrop() {
+        if (activeIndex == null || !candidates[activeIndex]) return;
+        var cand = candidates[activeIndex];
+        cand.status = 'skipped';
+        queue = queue.filter(function (q) { return q.candidateIndex !== activeIndex; });
+        renderReview();
+        var next = nextPending(activeIndex);
+        if (next >= 0) focusHit(next);
+        else {
+            showOverview();
+            updateCropButtons();
+        }
+    }
+
+    function prevCrop() {
+        if (activeIndex == null || activeIndex <= 0) return;
+        focusHit(activeIndex - 1);
     }
 
     async function extractFile(file, extractScale) {
@@ -528,6 +986,10 @@
         showError('');
         $('scanReviewCard').style.display = 'none';
         clearPreview();
+        lastItems = [];
+        candidates = [];
+        queue = [];
+        lastMissing = [];
         setStatus(true, 'Avataan PDF…', 5);
 
         var extractScale = 1;
@@ -554,15 +1016,38 @@
             }
 
             setStatus(true, 'Etsitään koodeja…', 88);
-            var lines = FS.itemsToLines(allItems);
-            var stacks = FS.itemsToStacks(allItems);
-            var found = FS.findMatches(queries, lines, stacks);
+            var found = FS.findMatches(queries, allItems);
+            lastItems = allItems;
+            lastMissing = found.missing || [];
+            lastFileCount = selectedFiles.length;
 
-            lastHits = [];
+            candidates = [];
             found.results.forEach(function (r) {
                 r.hits.forEach(function (h) {
-                    lastHits.push(h);
+                    candidates.push({
+                        query: h.query,
+                        full: h.full || h.query,
+                        page: h.page || 1,
+                        file: h.file,
+                        bbox: copyBBox(h.bbox),
+                        crop: copyBBox(h.bbox),
+                        status: 'pending'
+                    });
                 });
+            });
+            candidates.sort(function (a, b) {
+                var fa = String(a.file || '');
+                var fb = String(b.file || '');
+                if (fa !== fb) return fa < fb ? -1 : 1;
+                var pa = a.page || 1;
+                var pb = b.page || 1;
+                if (pa !== pb) return pa - pb;
+                var ay = a.bbox ? a.bbox.y : 0;
+                var by = b.bbox ? b.bbox.y : 0;
+                if (Math.abs(ay - by) > 4) return ay - by;
+                var ax = a.bbox ? a.bbox.x : 0;
+                var bx = b.bbox ? b.bbox.x : 0;
+                return ax - bx;
             });
 
             setStatus(true, 'Piirretään esikatselu…', 94);
@@ -580,10 +1065,15 @@
                 lastPreview = rendered;
             }
 
-            renderResults(found, selectedFiles.length);
+            renderReview();
             setStatus(false);
             if (warnings.length) {
                 showError(warnings.join(' · '));
+            }
+            if (candidates.length) {
+                await focusHit(0);
+            } else {
+                updateCropButtons();
             }
         } catch (err) {
             console.error(err);
@@ -592,39 +1082,68 @@
         }
     }
 
-    function renderResults(found, fileCount) {
-        lastFoundLines = lastHits.map(function (h) { return h.full; });
-        var hitCount = lastHits.length;
+    function resultRowHtml(text, meta, index, selected) {
+        var hitAttr = index == null ? '' :
+            ' role="button" tabindex="0" data-hit-index="' + index +
+            '" aria-pressed="' + (selected ? 'true' : 'false') + '"';
+        var cls = 'result-row' + (index != null ? ' result-row-hit' : '') + (selected ? ' is-selected' : '');
+        return '<div class="' + cls + '"' + hitAttr + '>' +
+            '<span class="result-text">' + escapeHtml(text) + '</span>' +
+            '<span class="result-meta">' + escapeHtml(meta) + '</span></div>';
+    }
+
+    function renderReview() {
+        var pending = [];
+        candidates.forEach(function (h, i) {
+            if (h.status === 'pending') pending.push(i);
+        });
 
         $('scanSummaryBadge').textContent =
-            hitCount + ' osumaa · ' + found.missing.length + ' puuttuu · ' +
-            fileCount + (fileCount === 1 ? ' PDF' : ' PDF:ää');
+            pending.length + ' käsittelemättä · ' + queue.length + ' hyväksytty · ' +
+            lastMissing.length + ' puuttuu · ' +
+            lastFileCount + (lastFileCount === 1 ? ' PDF' : ' PDF:ää');
 
         var foundHost = $('foundList');
-        if (!hitCount) {
-            foundHost.innerHTML = '<div class="result-empty">Ei osumia.</div>';
+        var pendingWrap = $('pendingSection');
+        if (!pending.length) {
+            foundHost.innerHTML = candidates.length
+                ? '<div class="result-empty">Kaikki osumat käsitelty.</div>'
+                : '<div class="result-empty">Ei osumia.</div>';
         } else {
-            foundHost.innerHTML = lastHits.map(function (h, i) {
-                var meta = escapeHtml(h.file || '') + ' · s. ' + (h.page || 1);
-                return '<div class="result-row result-row-hit" role="button" tabindex="0" data-hit-index="' +
-                    i + '" aria-pressed="false"><span class="result-text">' +
-                    escapeHtml(h.full) + '</span> <span class="result-meta">' + meta + '</span></div>';
+            foundHost.innerHTML = pending.map(function (i) {
+                var h = candidates[i];
+                var meta = (h.file || '') + ' · s. ' + (h.page || 1);
+                return resultRowHtml(h.query || h.full, meta, i, i === activeIndex);
             }).join('');
         }
+        if (pendingWrap) pendingWrap.style.display = '';
+
+        var queueHost = $('queueList');
+        var queueWrap = $('queueSection');
+        if (!queue.length) {
+            queueHost.innerHTML = '<div class="result-empty">Ei hyväksyttyjä rajauksia.</div>';
+        } else {
+            queueHost.innerHTML = queue.map(function (q) {
+                var meta = (q.file || '') + ' · s. ' + (q.page || 1);
+                return resultRowHtml(q.full, meta, q.candidateIndex, q.candidateIndex === activeIndex);
+            }).join('');
+        }
+        if (queueWrap) queueWrap.style.display = '';
 
         var missingWrap = $('missingSection');
         var missingHost = $('missingList');
-        if (!found.missing.length) {
+        if (!lastMissing.length) {
             missingWrap.style.display = 'none';
             missingHost.innerHTML = '';
         } else {
             missingWrap.style.display = '';
-            missingHost.innerHTML = found.missing.map(function (q) {
+            missingHost.innerHTML = lastMissing.map(function (q) {
                 return '<div class="result-row"><span class="result-text">' + escapeHtml(q) + '</span></div>';
             }).join('');
         }
 
         $('scanReviewCard').style.display = '';
+        updateCropButtons();
     }
 
     async function copyText(text, btn) {
@@ -690,23 +1209,21 @@
         }
     }
 
-    function bindFoundList() {
-        var foundHost = $('foundList');
-        if (!foundHost || foundHost.dataset.bound) return;
-        foundHost.addEventListener('click', function (e) {
+    function bindResultLists() {
+        function onActivate(e) {
             var row = e.target.closest('[data-hit-index]');
             if (!row) return;
+            if (e.type === 'keydown' && e.key !== 'Enter' && e.key !== ' ') return;
+            if (e.type === 'keydown') e.preventDefault();
             focusHit(Number(row.getAttribute('data-hit-index')));
+        }
+        ['foundList', 'queueList'].forEach(function (id) {
+            var host = $(id);
+            if (!host || host.dataset.bound) return;
+            host.addEventListener('click', onActivate);
+            host.addEventListener('keydown', onActivate);
+            host.dataset.bound = '1';
         });
-        foundHost.addEventListener('keydown', function (e) {
-            var row = e.target.closest('[data-hit-index]');
-            if (!row) return;
-            if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                focusHit(Number(row.getAttribute('data-hit-index')));
-            }
-        });
-        foundHost.dataset.bound = '1';
     }
 
     function clearAll() {
@@ -719,16 +1236,24 @@
 
     function init() {
         bindDropzone();
-        bindFoundList();
+        bindResultLists();
         $('scanBtn').addEventListener('click', runScan);
         $('clearBtn').addEventListener('click', clearAll);
         $('copyLinesBtn').addEventListener('click', function () {
-            copyText(lastFoundLines.join('\n'), $('copyLinesBtn'));
+            var lines = queue.map(function (q) { return q.full; }).filter(Boolean);
+            copyText(lines.join('\n'), $('copyLinesBtn'));
         });
         var resetBtn = $('previewResetBtn');
-        if (resetBtn) {
-            resetBtn.addEventListener('click', resetPreviewFocus);
-        }
+        if (resetBtn) resetBtn.addEventListener('click', showOverview);
+        var acceptBtn = $('cropAcceptBtn');
+        if (acceptBtn) acceptBtn.addEventListener('click', acceptCrop);
+        var skipBtn = $('cropSkipBtn');
+        if (skipBtn) skipBtn.addEventListener('click', skipCrop);
+        var prevBtn = $('cropPrevBtn');
+        if (prevBtn) prevBtn.addEventListener('click', prevCrop);
+        window.addEventListener('resize', function () {
+            requestAnimationFrame(syncActiveOverlay);
+        });
         var fileList = $('scannerFileList');
         if (fileList && !fileList.dataset.bound) {
             fileList.addEventListener('click', function (e) {
@@ -740,6 +1265,7 @@
             });
             fileList.dataset.bound = '1';
         }
+        updateCropButtons();
     }
 
     window.fpScanApp = {
